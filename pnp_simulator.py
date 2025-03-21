@@ -288,15 +288,17 @@ class PNP(PDEBase):
 
         def post_step_hook(self, state, t):
             """
-            Update secondary parameters after every iteration of the simulation
+            Update the voltage after every iteration of the simulation using self.voltageFunction
 
             Args:
                 state_data (FieldCollection): current state of the simulation
                 t (float): simulation time
             Returns:
-                hmmmm
+                None
             """
-            pass
+            #calculate new voltage, update boundary conditions
+            newVoltage = self.voltageFunction(t, state, *self.voltageArgs)
+            self.ePot_bc = {"x-": {"derivative": newVoltage}, "x+": {"value": 0}}
 
         return post_step_hook, 0.0 # hook function + initial data for t
 
