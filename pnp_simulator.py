@@ -1,6 +1,7 @@
 import numpy as np
 from pde import PDEBase, FieldCollection, CartesianGrid, ScalarField,  MemoryStorage,plot_kymograph, plot_kymographs, solve_poisson_equation
 from matplotlib import pyplot as plt
+import math
 
 # PDENSTEch - Partial Differential Equation Numerical Solvert for Transient Electrochemistry
 
@@ -24,7 +25,71 @@ from matplotlib import pyplot as plt
 #       plot the results
 
 params = {
+    #todo: move parameters that are defined in terms of other parameters to unpack_params method
+    #todo: convert species dependent parameters to index-matched lists
+    #todo: handle unit conversions in unpack params
+    # define constants. Units are m, eV, e, K, V
 
+    ####################################################
+    ####### Chemical Components ####################
+    ##################################################
+
+    # note: all lists describing the chemical species to simulate MUST have equal lengths
+    "names" : [], # list of strings: names of each species in simulation
+    "charges" : [], # list of integers: charges of each species
+    "diffusivities" : [], # list of floats: diffusion constant of each species, in cm^2/s
+    "bulkConcentrations" : [], # list of floats: concentration at far edge of simulation box, in mol/L
+    "initialConcentrationProfiles" : [], # list of floats or ndarrays: initial concentration profiles
+                                        # options:
+                                        # "bulk" to match the bulkConcentration of the species
+                                        # "zero" to set initial to zero
+                                        # array: set custom values at each point.
+                                        #   must be a numpy array. If the length is longer than the number of grid points,
+                                        #   extra values will be cut off. If the array is shorter than the number of grid points,
+                                        #   an IndexError will be raised
+    "solventDielectric" : 1, # float: relative dielectric constant of the solvent
+    "temperature": 300,  # float: temperature in K. Raising temperature increases the ratio of diffusion to drift
+
+    ##################################################
+    ######### Simulation Conditions ##################
+    ################################################
+
+    #todo: figure out the best way to represent voltage profile. a function input is probably the best?
+    "voltageProfile" : [], # list: voltage vs time
+
+    "gridMax" : 1, # float: distance from the electrode surface to simulate, in nm
+    "gridStep" : 0.01, # float: distance between grid points, in nm
+    "tStep" : 0.00001, # float: time step interval for each simulation iteration, in ns
+    "tStop" : 0.1, # float: time the simulation will run to. Number of steps = tStop/tStep
+    "trackerStep" : 0.001, # float: time step interval that the tracker will record data, in ns
+                           # this should always be greater than tStep and less than tStop
+                           # selecting a smaller number will give more information in plots but at the cost of memory usage
+    # NOTE ON NUMERICAL STABILITY: stability of the simulation is sensitive to the ratio of gridStep to tStep
+    #   this is because derivative boundary conditions will cause the results to be divided by the gridStep, resulting in larger values
+    #   at the same time, diffusion can only spread large changes in concentration out by one grid point each iteration
+    #   as a result, large changes at the edges from the gridStep need to be moderated by a smaller tStep
+    #   empirically, a 10x decrease in gridStep requires a 100x decrease in tStep to maintain stability.
+    #   0.01 gridStep and 0.00001 tStep is a good starting point
+
+    ################################################
+    ###### Physical Constants #####################
+    ################################################
+
+    "vacuumPermitivitty" : 0.055263, # e^2/eVnm
+    "charge" : 1, # electron charge (elem charge)
+    "kb" : 8.617*(10**-5), # boltzmann constant (eV/K)
+    "Av" : 6.022 * (10**23), # Avogadro's number
+
+    ##############################################
+    ####### Plotting and Saving #################
+    ############################################
+    "plotQ" : False, # boolean: should a plots be generated after running the simulation?
+    "saveQ" : False, # boolean: should the result of the simulation and plots (if made) be pickled (saved) when the simulation finishes?
+    "saveName" : "default", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
+    "saveDir" : "", # string: the directory to save data in
+    "plotTypes" : [], # list of strings: what types of plots should be generated.
+                        # Current options are "kymographs",
+    "plotSaveFormat" : ".pdf" # string: format to save the plots
 }
 
 class PNP(PDEBase):
@@ -44,6 +109,7 @@ class PNP(PDEBase):
         solve(fields, t_range, dt, tracker) -- PDEBase method used to run the simulation. It is not modified here but is
         called by the run_simulation function elsewhere in the script
         plot_results(plotTypes, saveQ, saveName, saveDir) -- plots the results of the simulation
+        check_index_matching(lists, keys) -- checks that a list of lists all have the same length, raises an exception otherwise
         """
         pass
 
@@ -54,15 +120,69 @@ class PNP(PDEBase):
         Args:
             params (dict): a dict of the simulation parameters
             params has several required keys. These are:
-
+                "names", "charges", "diffusivities", "bulkConcentrations", "initialConcentrationProfiles", "solventDielectric",
+                "temperature", "voltageProfile", "gridMax", "gridStep", "tStep", "tStop", "trackerStep", "vacuumPermitivitty",
+                "charge", "kb", "Av", "plotQ", "saveQ", "saveName", "saveDir", "plotTypes", "plotSaveFormat"
         Return:
             values necessary to run PNP.solve
             fields (FieldCollection): initial values of the concentration fields of each species in the simulation
             t_range (float): end time of the simulation
             dt (float): time step of the simulation
             tracker (list): specifications for the simulation tracker
+
+        Several class variables are initialized, including constants that are used in every simulation iteration as well
+        as the first set of boundary conditions:
+            self.c_bcs: boundary conditions for each concentration field. Used to calculate diffusion derivatives
+            self.ePot_bc: boundary conditions for the electric potential. Used to solve Poisson's Equation and calculate the potential gradient
+                Note that this boundary condition can change over the course of the simulation as specified by the voltage profile
+            self.drift_bc: boundary conditions for calculating the drift contribution to dc/dt (divergence of the concentration * potential gradient)
         """
-        pass
+        # check that parameters are properly index matched
+        # for now the index matched keys are just hard coded here. This may change in the future
+        indexMatchedKeys = ["names", "charges", "diffusivities", "bulkConcentrations", "initialConcentrationProfiles"]
+        indexMatchedLists = [params[key] for key in indexMatchedKeys]
+        self.check_index_matching(indexMatchedLists, indexMatchedKeys)
+
+        # calculate values that will be used in every simulation iteration and save them as class variables
+        self.dielectric = params["solventDielectric"] * params["vacuumPermitivitty"] # absolute solvent dielectric constant in e^2/eVnm
+        self.diffusivities = (10**5) * params["diffusivities"] # convert diffusivities from cm^2/s to nm^2/ns
+        self.kt = params["kb"] * params["temperature"] # boltzmann constant * temperature in eV
+        self.bulk_concs = (self.Av / (10**24)) * params["bulkConcentrations"] # bulk concentrations converted from mol/L to number / nm^3
+        self.zs = params["charges"]
+        self.numberOfSpecies = len(self.zs) # number of species comes up a lot later
+
+        # determine boundary conditions and save them as class variables
+        # todo: check that the bc explanations are correct and consistent
+        # concentration boundary conditions for calculating diffusion:
+        #   Left derivative is zero since no flux comes from the electrode
+        #   Right value (far edge away from electrode) is the bulk value
+        self.c_bcs = [{"x-": {"derivative": 0}, "x+": {"value": conc}} for conc in self.bulk_concs]
+        # initial electric potential boundary conditions for solving the Poisson equation and later calculating the gradient of the potential
+        #   Left derivative is set to the applied voltage since the derivative of potential is field
+        #   Right value is set to 0 since there should be not electric potential at the far end of the simulation
+        #todo: return to this when you figure out how to handle the voltage profile
+        self.ePot_bc = {"x-": {"derivative": params["voltageProfile"][0]}, "x+": {"value": 0}}
+        # drift boundary conditions for determining the concentration change due to electromigration
+        #   Left value is 0 since no concentration change comes from the electrode
+        #   Right derivative is 0 since no flux due to drift can occur from the far boundary
+        self.drift_bc = {"x-": {"value": 0}, "x+": {"derivative": 0}}
+
+        # calculate the debye length, just because it's good to know and we might want it later
+        # print a note comparing the debye length to the grid size. grid size should be >> debye length
+        self.bulkChargeDensity = sum([(params["charges"][i]**2) * self.bulk_conc[i] for i in range(len(self.bulk_conc))])
+        self.debye = np.sqrt((self.dielectric * self.kt)/self.bulkChargeDensity)
+        print("Grid size is " + str(params["gridMax"]) + " nm")
+        print("Debye length is " + str(self.debye) + " nm")
+
+        # initialize grid and concentration fields
+        initConcFields = self.initialize_fields(params)
+
+        # create tracker
+        storage = MemoryStorage()
+        trackerSpecification = ["progress", storage.tracker(params["trackerStep"])]
+
+        # return inputs to PNP.solve()
+        return initConcFields, params["tStop"], params["tStep"], trackerSpecification
 
     def initialize_fields(self, params:dict):
         """
@@ -73,7 +193,43 @@ class PNP(PDEBase):
         Returns:
             FieldCollection: the initial concentration profiles of each simulated species. These are also saved as class variables
         """
-        pass
+        # initialize the grid
+        numberOfPoints = math.floor(params["gridMax"] / params["gridStep"]) # math.floor used to ensure numberOfPoints is an integer
+        grid = CartesianGrid([(0, params["gridMax"])], [numberOfPoints], False)
+
+        # for each species, create a field using the corresponding init profile
+        concArrays = []
+        for i in range(self.numberOfSpecies):
+
+            initProfile = params["initialConcentrationProfiles"][i]
+
+            # if "bulk" match bulk conc
+            if initProfile == "bulk":
+                profileArray = np.ones(numberOfPoints) * self.bulk_concs[i]
+
+            # if "zero" set to 0
+            elif initProfile == "zero":
+                profileArray = np.zeros(numberOfPoints)
+
+            # if a custom array, first check that it is the correct length (raise error if not), than create
+            elif type(initProfile) == np.ndarray:
+
+                # handle malformed inputs
+                if len(initProfile) < numberOfPoints:
+                    IndexError("PNP.initialize_fields: a supplied initial concentration profile for species " +
+                               str(params["names"][i])) + (" is shorter than the grid length specified by gridMax and "
+                                                           "gridStep. Simulation cannot run until this is addressed.")
+                elif len(initProfile) > numberOfPoints:
+                    print("PNP.initialize_fields: a supplied initial concentration profile for species " +
+                               str(params["names"][i])) + (" is longer than the grid length specified by gridMax and "
+                                                           "gridStep. Excess values beyond the grid length will be ignored.")
+
+                profileArray = initProfile[:numberOfPoints] # slice cuts off excess values. Warning about this situation is raised above
+
+            concArrays.append(profileArray)
+
+        # gather all concArrays into a FieldCollection and return
+        return FieldCollection([ScalarField(grid, concArray) for concArray in concArrays])
 
     def evolution_rate(self, state, t=0):
         """
@@ -90,7 +246,28 @@ class PNP(PDEBase):
         change in concentration is evaluated using the concentration Laplacian (diffusion) and the divergence of the field
         gradient (drift)
         """
-        pass
+
+        concs = state  # state is the next set of concentration fields
+
+        # generate charge density field from c by summing all charges times concentration
+        chargeConcs = [self.zs[i] * concs[i] for i in range(self.numberOfSpecies)]
+        p = sum(chargeConcs)
+
+        # define Poisson Equation right hand side (-p/dielectric)
+        poissonRHS = -1 * p / self.dielectric
+
+        # solve for electric potential by Poisson's equation
+        ePotential = solve_poisson_equation(poissonRHS, self.ePot_bc)
+
+        # determine the electric field by taking the gradient of the potential
+        eField = ePotential.gradient(bc=self.ePot_bc)
+
+        # solve for the drift and diffusion components of the Nernst-Planck equations, then combine for total dc/dt
+        drift = [((self.diffusivities[i] * chargeConcs[i] / self.kt) * eField).divergence(bc = self.drift_bc) for i in range(self.numberOfSpecies)]
+        diff = [self.diffusivities[i] * concs[i].laplace(bc = self.c_bcs[i]) for i in range(self.numberOfSpecies)]
+        dcdt = [drift[i] + diff[i] for i in range(self.numberOfSpecies)]
+
+        return FieldCollection(dcdt)
 
     def make_post_step_hook(self, state):
         """Create a hook function that is called after every time step"""
@@ -126,6 +303,37 @@ class PNP(PDEBase):
         """
 
         pass
+
+    def check_index_matching(self,lists:list, keys:list):
+        """
+        Checks that every element of an input list of lists has the same length
+
+        Args:
+            lists (list): a list of lists taken from input parameters
+            keys (list): a list of the keys associated with each list in the parameter dict
+
+        Returns:
+            boolean: True if index matching is correct, else false. Note false should never return: an exception should be raised
+        """
+
+        # check that every element of the input is a list
+        for i in range(len(lists)):
+            if type(lists[i]) != list:
+                raise TypeError("PNP.check_index_matching: Parameter " + str(keys[i]) + " must be a list. It is currently set to "
+                                + str(lists[i]) + ". Please check the value and restart the script.")
+
+        # get the length of the first list
+        len0 = len(lists[0])
+
+        # if any other list does not match the first length, raise an error
+        for i in range(len(lists)):
+            if len(lists[i]) != len0:
+                raise ValueError("PNP.check_index_matching: Parameters " + str(keys[0]) + " and " +
+                                 str(keys[i])) + (" have different lengths and are thus not properly index matched. Please "
+                                "check that all index matched keys " + str(keys) + " have the same length.")
+
+        return True
+
 
 def run_simulation(params:dict):
     """
