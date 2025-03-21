@@ -2,6 +2,10 @@ import numpy as np
 from pde import PDEBase, FieldCollection, CartesianGrid, ScalarField,  MemoryStorage,plot_kymograph, plot_kymographs, solve_poisson_equation
 from matplotlib import pyplot as plt
 import math
+import voltage_functions as vf
+import pickle
+import os
+import time
 
 # PDENSTEch - Partial Differential Equation Numerical Solvert for Transient Electrochemistry
 
@@ -54,9 +58,10 @@ params = {
     ######### Simulation Conditions ##################
     ################################################
 
-    #todo: figure out the best way to represent voltage profile. a function input is probably the best?
-    "voltageProfile" : [], # list: voltage vs time
-
+    "voltageFunction" : vf.cosVoltage, # function: must take the state and time as arguments and
+                            # output a single float to be used as the applied voltage.
+    "voltageFunctionArgs" : [0.0001, 1, 0], # list: extra arguments to pass to the voltage function, if needed
+                                # if no extra arguments are needed, use an empty list
     "gridMax" : 1, # float: distance from the electrode surface to simulate, in nm
     "gridStep" : 0.01, # float: distance between grid points, in nm
     "tStep" : 0.00001, # float: time step interval for each simulation iteration, in ns
@@ -85,6 +90,7 @@ params = {
     ############################################
     "plotQ" : False, # boolean: should a plots be generated after running the simulation?
     "saveQ" : False, # boolean: should the result of the simulation and plots (if made) be pickled (saved) when the simulation finishes?
+    "showPlotsQ": False,  # boolean: should the generated plots be shown after they are generated?
     "saveName" : "default", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
     "saveDir" : "", # string: the directory to save data in
     "plotTypes" : [], # list of strings: what types of plots should be generated.
@@ -108,7 +114,7 @@ class PNP(PDEBase):
         the PNP class to change the applied voltage and evaluate any user-defined metrics on the data
         solve(fields, t_range, dt, tracker) -- PDEBase method used to run the simulation. It is not modified here but is
         called by the run_simulation function elsewhere in the script
-        plot_results(plotTypes, saveQ, saveName, saveDir) -- plots the results of the simulation
+        plot_data(plotTypes, saveQ, saveName, saveDir) -- plots the results of the simulation
         check_index_matching(lists, keys) -- checks that a list of lists all have the same length, raises an exception otherwise
         """
         pass
@@ -143,6 +149,9 @@ class PNP(PDEBase):
         indexMatchedLists = [params[key] for key in indexMatchedKeys]
         self.check_index_matching(indexMatchedLists, indexMatchedKeys)
 
+        # save the initial parameters for later reference
+        self.params = params
+
         # calculate values that will be used in every simulation iteration and save them as class variables
         self.dielectric = params["solventDielectric"] * params["vacuumPermitivitty"] # absolute solvent dielectric constant in e^2/eVnm
         self.diffusivities = (10**5) * params["diffusivities"] # convert diffusivities from cm^2/s to nm^2/ns
@@ -150,22 +159,6 @@ class PNP(PDEBase):
         self.bulk_concs = (self.Av / (10**24)) * params["bulkConcentrations"] # bulk concentrations converted from mol/L to number / nm^3
         self.zs = params["charges"]
         self.numberOfSpecies = len(self.zs) # number of species comes up a lot later
-
-        # determine boundary conditions and save them as class variables
-        # todo: check that the bc explanations are correct and consistent
-        # concentration boundary conditions for calculating diffusion:
-        #   Left derivative is zero since no flux comes from the electrode
-        #   Right value (far edge away from electrode) is the bulk value
-        self.c_bcs = [{"x-": {"derivative": 0}, "x+": {"value": conc}} for conc in self.bulk_concs]
-        # initial electric potential boundary conditions for solving the Poisson equation and later calculating the gradient of the potential
-        #   Left derivative is set to the applied voltage since the derivative of potential is field
-        #   Right value is set to 0 since there should be not electric potential at the far end of the simulation
-        #todo: return to this when you figure out how to handle the voltage profile
-        self.ePot_bc = {"x-": {"derivative": params["voltageProfile"][0]}, "x+": {"value": 0}}
-        # drift boundary conditions for determining the concentration change due to electromigration
-        #   Left value is 0 since no concentration change comes from the electrode
-        #   Right derivative is 0 since no flux due to drift can occur from the far boundary
-        self.drift_bc = {"x-": {"value": 0}, "x+": {"derivative": 0}}
 
         # calculate the debye length, just because it's good to know and we might want it later
         # print a note comparing the debye length to the grid size. grid size should be >> debye length
@@ -177,9 +170,30 @@ class PNP(PDEBase):
         # initialize grid and concentration fields
         initConcFields = self.initialize_fields(params)
 
+        # gather the voltage function and calculate the first voltage at t=0
+        # this must be done after fields are initialized
+        self.voltageFunction = params["voltageFunction"]
+        self.voltageArgs = params["voltageFunctionArgs"]
+        self.initVoltage = self.voltageFunction(0, initConcFields, *self.voltageArgs)
+
+        # determine boundary conditions and save them as class variables
+        # todo: check that the bc explanations are correct and consistent
+        # concentration boundary conditions for calculating diffusion:
+        #   Left derivative is zero since no flux comes from the electrode
+        #   Right value (far edge away from electrode) is the bulk value
+        self.c_bcs = [{"x-": {"derivative": 0}, "x+": {"value": conc}} for conc in self.bulk_concs]
+        # initial electric potential boundary conditions for solving the Poisson equation and later calculating the gradient of the potential
+        #   Left derivative is set to the applied voltage since the derivative of potential is field
+        #   Right value is set to 0 since there should be not electric potential at the far end of the simulation
+        self.ePot_bc = {"x-": {"derivative": self.initVoltage}, "x+": {"value": 0}}
+        # drift boundary conditions for determining the concentration change due to electromigration
+        #   Left value is 0 since no concentration change comes from the electrode
+        #   Right derivative is 0 since no flux due to drift can occur from the far boundary
+        self.drift_bc = {"x-": {"value": 0}, "x+": {"derivative": 0}}
+
         # create tracker
-        storage = MemoryStorage()
-        trackerSpecification = ["progress", storage.tracker(params["trackerStep"])]
+        self.storage = MemoryStorage()
+        trackerSpecification = ["progress", self.storage.tracker(params["trackerStep"])]
 
         # return inputs to PNP.solve()
         return initConcFields, params["tStop"], params["tStep"], trackerSpecification
@@ -286,7 +300,7 @@ class PNP(PDEBase):
 
         return post_step_hook, 0.0 # hook function + initial data for t
 
-    def plot_results(self, params:dict):
+    def plot_data(self, params:dict):
         """
         Plots the results of the simulation
 
@@ -297,12 +311,86 @@ class PNP(PDEBase):
                 generated one at a time in the order specified.
                 Plot types: "kymographs", ...
             saveQ (boolean): should the plots be saved. All plots save at 300 dpi
+            showPlotsQ (boolean): should the plots be displayed after they are generated
+                Note: if both saveQ and showPlotsQ are both false, this function will do nothing
             saveFormat (string): format the plots are saved in. Default is .pdf
             saveName (string): name of the plots that are saved. File names are saveName_plotType.saveFormat
             saveDir (string): directory to save the plots in
+
+        Returns:
+            None (plots are shown or saved as specified)
         """
 
-        pass
+        # gather inputs in a cleaner way
+        plotTypes = params["plotTypes"]
+        saveQ = params["saveQ"]
+        showPlotsQ = params["showPlotsQ"]
+        saveFormat = params["saveFormat"]
+        saveName = params["saveName"]
+        saveDir = params["saveDir"]
+
+        # generate the base filename and generate a timestamp in case there are any overlaps with existing files
+        fileBaseName = os.path.join(saveDir, saveName)
+        timeStamp = time.time()
+
+        # iterate through the specified plots, displaying and saving as needed
+        for plot in plotTypes:
+
+            match plot:
+
+                case "kymographs":
+                    plot_kymographs(self.storage)
+
+                #todo: implement more plot types otherwise this math looks silly
+
+            if showPlotsQ:
+                plt.show()
+
+            if saveQ:
+
+                fileName = fileBaseName + "_" + plot + "_" + saveFormat
+
+                # check that the file does not already exist. If it does, print a warning and save with the time appended
+                if os.path.isfile(fileName):
+                    fileName = os.path.join(params["saveDir"], params["saveName"]) + "_" + plot + "_" + str(
+                        time.time()) + saveFormat
+                    print(
+                        "PNP.plot_data: WARNING - specified saveDir + saveName already exists. Saving plot as " +
+                        fileName + " instead.")
+
+                # save the file and close the plot if it wasn't displayed
+                plt.savefig(fileName, dpi = 300)
+                if not showPlotsQ:
+                    plt.close()
+
+
+    def save_data(self, params:dict, result):
+        """
+        Saves the results of the simulation as a pickle
+
+        Args:
+            params (dict): a dict of simulation parameters. The following keys are required to determine the function behavior:
+            Keys:
+            saveQ (boolean): should the simulation data be saved
+            saveName (string): name of the plots that are saved. File names are saveName_data.pickle
+            saveDir (string): directory to save the plots in
+        """
+        if "saveQ" not in params.keys() or "saveName" not in params.keys() or "saveDir" not in params.keys():
+            ValueError("PNP.save_data: supplied parameter dict does not have the required keys saveQ, saveName, and saveDir.")
+
+        # make sure the result is saved as a class variable
+        self.result = result
+
+        fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data.pickle"
+
+        # check that the file does not already exist. If it does, print a warning and save with the time appended
+        if os.path.isfile(fileName):
+            fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data_" + str(time.time()) + ".pickle"
+            print("PNP.save_data: WARNING - specified saveDir + saveName already exists. Saving simulation data as " +
+                  fileName + " instead.")
+        with open(fileName, 'wb') as f:
+            pickle.dump(self, f)
+        f.close()
 
     def check_index_matching(self,lists:list, keys:list):
         """
@@ -335,6 +423,12 @@ class PNP(PDEBase):
         return True
 
 
+
+
+#########################################################
+############ Run Simulation ############################
+#######################################################
+
 def run_simulation(params:dict):
     """
     Wrapper function which runs the PNP simulation based on the supplied parameters
@@ -348,7 +442,8 @@ def run_simulation(params:dict):
     eq = PNP()
     solveParams = eq.unpack_parameters(params)
     result = eq.solve(*solveParams)
-    eq.plot_results(params)
+    eq.save_data(params, result)
+    eq.plot_data(params)
     return 0
 
 run_simulation(params)
