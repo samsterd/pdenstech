@@ -39,18 +39,18 @@ params = {
     ##################################################
 
     # note: all lists describing the chemical species to simulate MUST have equal lengths
-    "names" : [], # list of strings: names of each species in simulation
-    "charges" : [], # list of integers: charges of each species
-    "diffusivities" : [], # list of floats: diffusion constant of each species, in cm^2/s
-    "bulkConcentrations" : [], # list of floats: concentration at far edge of simulation box, in mol/L
-    "initialConcentrationProfiles" : [], # list of floats or ndarrays: initial concentration profiles
-                                        # options:
-                                        # "bulk" to match the bulkConcentration of the species
-                                        # "zero" to set initial to zero
-                                        # array: set custom values at each point.
-                                        #   must be a numpy array. If the length is longer than the number of grid points,
-                                        #   extra values will be cut off. If the array is shorter than the number of grid points,
-                                        #   an IndexError will be raised
+    "names": ["Mg", "Cl"],  # list of strings: names of each species in simulation
+    "charges": [2, -1],  # list of integers: charges of each species
+    "diffusivities": [2.2 * (10 ** -5), 2.2 * (10 ** -5)], # list of floats: diffusion constant of each species, in cm^2/s
+    "bulkConcentrations": [0.05, 0.1],  # list of floats: concentration at far edge of simulation box, in mol/L
+    "initialConcentrationProfiles": ["bulk", "bulk"],  # list of floats or ndarrays: initial concentration profiles
+                                                        # options:
+                                                        # "bulk" to match the bulkConcentration of the species
+                                                        # "zero" to set initial to zero
+                                                        # array: set custom values at each point.
+                                                        #   must be a numpy array. If the length is longer than the number of grid points,
+                                                        #   extra values will be cut off. If the array is shorter than the number of grid points,
+                                                        #   an IndexError will be raised
     "solventDielectric" : 1, # float: relative dielectric constant of the solvent
     "temperature": 300,  # float: temperature in K. Raising temperature increases the ratio of diffusion to drift
 
@@ -60,13 +60,13 @@ params = {
 
     "voltageFunction" : vf.cosVoltage, # function: must take the state and time as arguments and
                             # output a single float to be used as the applied voltage.
-    "voltageFunctionArgs" : [0.0001, 1, 0], # list: extra arguments to pass to the voltage function, if needed
+    "voltageFunctionArgs" : [0.0005, 0.1, 0.05], # list: extra arguments to pass to the voltage function, if needed
                                 # if no extra arguments are needed, use an empty list
     "gridMax" : 1, # float: distance from the electrode surface to simulate, in nm
-    "gridStep" : 0.01, # float: distance between grid points, in nm
-    "tStep" : 0.00001, # float: time step interval for each simulation iteration, in ns
-    "tStop" : 0.1, # float: time the simulation will run to. Number of steps = tStop/tStep
-    "trackerStep" : 0.001, # float: time step interval that the tracker will record data, in ns
+    "gridStep": 0.01,  # float: distance between grid points, in nm
+    "tStep": 0.00001,  # float: time step interval for each simulation iteration, in ns
+    "tStop": 0.005,  # float: time the simulation will run to. Number of steps = tStop/tStep
+    "trackerStep" : 0.00005, # float: time step interval that the tracker will record data, in ns
                            # this should always be greater than tStep and less than tStop
                            # selecting a smaller number will give more information in plots but at the cost of memory usage
     # NOTE ON NUMERICAL STABILITY: stability of the simulation is sensitive to the ratio of gridStep to tStep
@@ -88,13 +88,15 @@ params = {
     ##############################################
     ####### Plotting and Saving #################
     ############################################
-    "plotQ" : False, # boolean: should a plots be generated after running the simulation?
+    "plotQ" : True, # boolean: should a plots be generated after running the simulation?
     "saveQ" : False, # boolean: should the result of the simulation and plots (if made) be pickled (saved) when the simulation finishes?
-    "showPlotsQ": False,  # boolean: should the generated plots be shown after they are generated?
+    "showPlotsQ": True,  # boolean: should the generated plots be shown after they are generated?
     "saveName" : "default", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
     "saveDir" : "", # string: the directory to save data in
-    "plotTypes" : [], # list of strings: what types of plots should be generated.
-                        # Current options are "kymographs",
+    "plotTypes" : ["concVsTime"], # list of strings: what types of plots should be generated.
+                        # Current options are "kymographs", "concVsTime",
+    "plotArgs" : {"concVsTime":[0,5,20]}, # dict: key is a plotType and val is a list of extra parameters to pass into the plotting function
+                     #      Currently used for "concVsTime" to specify what points to plot
     "plotSaveFormat" : ".pdf" # string: format to save the plots
 }
 
@@ -151,30 +153,32 @@ class PNP(PDEBase):
 
         # save the initial parameters for later reference
         self.params = params
+        self.dt = params["tStep"]
 
         # calculate values that will be used in every simulation iteration and save them as class variables
+        # lists are converted to arrays in order to multiply by floats
         self.dielectric = params["solventDielectric"] * params["vacuumPermitivitty"] # absolute solvent dielectric constant in e^2/eVnm
-        self.diffusivities = (10**5) * params["diffusivities"] # convert diffusivities from cm^2/s to nm^2/ns
+        self.diffusivities = (10**5) * np.array(params["diffusivities"]) # convert diffusivities from cm^2/s to nm^2/ns
         self.kt = params["kb"] * params["temperature"] # boltzmann constant * temperature in eV
-        self.bulk_concs = (self.Av / (10**24)) * params["bulkConcentrations"] # bulk concentrations converted from mol/L to number / nm^3
-        self.zs = params["charges"]
+        self.bulk_concs = (params["Av"] / (10**24)) * np.array(params["bulkConcentrations"]) # bulk concentrations converted from mol/L to number / nm^3
+        self.zs = np.array(params["charges"])
         self.numberOfSpecies = len(self.zs) # number of species comes up a lot later
 
         # calculate the debye length, just because it's good to know and we might want it later
         # print a note comparing the debye length to the grid size. grid size should be >> debye length
-        self.bulkChargeDensity = sum([(params["charges"][i]**2) * self.bulk_conc[i] for i in range(len(self.bulk_conc))])
+        self.bulkChargeDensity = sum([(self.zs[i]**2) * self.bulk_concs[i] for i in range(self.numberOfSpecies)])
         self.debye = np.sqrt((self.dielectric * self.kt)/self.bulkChargeDensity)
         print("Grid size is " + str(params["gridMax"]) + " nm")
         print("Debye length is " + str(self.debye) + " nm")
 
         # initialize grid and concentration fields
-        initConcFields = self.initialize_fields(params)
+        self.initConcFields = self.initialize_fields(params)
 
         # gather the voltage function and calculate the first voltage at t=0
         # this must be done after fields are initialized
         self.voltageFunction = params["voltageFunction"]
         self.voltageArgs = params["voltageFunctionArgs"]
-        self.initVoltage = self.voltageFunction(0, initConcFields, *self.voltageArgs)
+        self.initVoltage = self.voltageFunction(0, self.initConcFields, *self.voltageArgs)
 
         # determine boundary conditions and save them as class variables
         # todo: check that the bc explanations are correct and consistent
@@ -196,7 +200,7 @@ class PNP(PDEBase):
         trackerSpecification = ["progress", self.storage.tracker(params["trackerStep"])]
 
         # return inputs to PNP.solve()
-        return initConcFields, params["tStop"], params["tStep"], trackerSpecification
+        return self.initConcFields, params["tStop"], params["tStep"], trackerSpecification
 
     def initialize_fields(self, params:dict):
         """
@@ -281,27 +285,35 @@ class PNP(PDEBase):
         diff = [self.diffusivities[i] * concs[i].laplace(bc = self.c_bcs[i]) for i in range(self.numberOfSpecies)]
         dcdt = [drift[i] + diff[i] for i in range(self.numberOfSpecies)]
 
+        # calculate the voltage for the next step
+        newVoltage = self.voltageFunction(t + self.dt, state, *self.voltageArgs)
+        self.ePot_bc = {"x-": {"derivative": newVoltage}, "x+": {"value": 0}}
+
         return FieldCollection(dcdt)
 
-    def make_post_step_hook(self, state):
-        """Create a hook function that is called after every time step"""
+    #todo: update documentation about abandoning post step hook. the necessary operations can be updated within the
+    #       evolution function and the post_step_hook is complicated :(
 
-        def post_step_hook(self, state, t):
-            """
-            Update the voltage after every iteration of the simulation using self.voltageFunction
+    # def make_post_step_hook(self, state):
+    #     """Create a hook function that is called after every time step"""
+    #
+    #     def post_step_hook(self, state, t):
+    #         """
+    #         Update the voltage after every iteration of the simulation using self.voltageFunction
+    #
+    #         Args:
+    #             state_data (FieldCollection): current state of the simulation
+    #             t (float): simulation time
+    #         Returns:
+    #             None
+    #         """
+    #         #calculate new voltage, update boundary conditions
+    #         newVoltage = self.voltageFunction(t, state, *self.voltageArgs)
+    #         self.ePot_bc = {"x-": {"derivative": newVoltage}, "x+": {"value": 0}}
+    #
+    #     return post_step_hook, 0.0 # hook function + initial data for t
 
-            Args:
-                state_data (FieldCollection): current state of the simulation
-                t (float): simulation time
-            Returns:
-                None
-            """
-            #calculate new voltage, update boundary conditions
-            newVoltage = self.voltageFunction(t, state, *self.voltageArgs)
-            self.ePot_bc = {"x-": {"derivative": newVoltage}, "x+": {"value": 0}}
-
-        return post_step_hook, 0.0 # hook function + initial data for t
-
+    # todo: verify this works on pickled data
     def plot_data(self, params:dict):
         """
         Plots the results of the simulation
@@ -321,13 +333,17 @@ class PNP(PDEBase):
 
         Returns:
             None (plots are shown or saved as specified)
+
+        Note that improper inputs in the params dict will result in printed errors rather than warnings. This is to allow
+        all plots that can be done to be performed without needing to restart the whole simulation.
         """
 
         # gather inputs in a cleaner way
         plotTypes = params["plotTypes"]
+        plotArgs = params["plotArgs"]
         saveQ = params["saveQ"]
         showPlotsQ = params["showPlotsQ"]
-        saveFormat = params["saveFormat"]
+        saveFormat = params["plotSaveFormat"]
         saveName = params["saveName"]
         saveDir = params["saveDir"]
 
@@ -343,7 +359,33 @@ class PNP(PDEBase):
                 case "kymographs":
                     plot_kymographs(self.storage)
 
-                #todo: implement more plot types otherwise this math looks silly
+                case "concVsTime":
+
+                    # todo: might be worth moving all of the individual plot functions to separate methods
+                    # check that the proper plotArgs are specified
+                    if "concVsTime" not in plotArgs.keys():
+                        print("PNP.plot_data WARNING: a \"concVsTime\" plot was specified in params[\"plotTypes\"] but no corresponding" +
+                                   "arguments were supplied in params[\"plotArgs\"]. Please add a key named \"concVsTime\" to params[\"plotArgs\"]." +
+                                   "No concVsTime plot will be produced.")
+                        continue # moves on to the next iteration of the for loop
+                    plotPoints = plotArgs["concVsTime"]
+                    if type(plotPoints) != list:
+                        print("PNP.plot_data WARNING: A concVsTime plot requires that the value of params[\"plotArgs\"][\"concVsTime\"] be a list." +
+                              "The current value is " + str(plotPoints) + ". No concVsTime plot will be produced.")
+                        continue
+
+                    # gather storage data, grid info, and generate time array
+                    storageArr = np.array(self.storage.data)
+                    gridArr = self.initConcFields.grid.coordinate_arrays[0]
+                    numberOfStoragePoints = math.floor(params["tStop"]/params["trackerStep"]) + 1
+                    tArr = np.linspace(0, params["tStop"], numberOfStoragePoints, endpoint = True)
+
+                    # generate the plots by iterating through plotPoints and numberOfSpecies
+                    for point in plotPoints:
+                        for species in range(self.numberOfSpecies):
+                            plotLabel = params["names"][species] + " at x = " + str(gridArr[point]) + " nm"
+                            plt.plot(tArr, storageArr[:, species, point], label = plotLabel)
+                    plt.legend()
 
             if showPlotsQ:
                 plt.show()
@@ -365,7 +407,8 @@ class PNP(PDEBase):
                 if not showPlotsQ:
                     plt.close()
 
-
+    # todo: figure out if data is actually pickling. If not,the issue is probably because a method cannot pickle itself?
+    #   i.e. cannot pickle(self). Consider gathering all relevant data into a dict and pickling that
     def save_data(self, params:dict, result):
         """
         Saves the results of the simulation as a pickle
@@ -380,19 +423,22 @@ class PNP(PDEBase):
         if "saveQ" not in params.keys() or "saveName" not in params.keys() or "saveDir" not in params.keys():
             ValueError("PNP.save_data: supplied parameter dict does not have the required keys saveQ, saveName, and saveDir.")
 
-        # make sure the result is saved as a class variable
-        self.result = result
+        if params["saveQ"]:
+            # make sure the result is saved as a class variable
+            self.result = result
 
-        fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data.pickle"
+            fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data.pickle"
 
-        # check that the file does not already exist. If it does, print a warning and save with the time appended
-        if os.path.isfile(fileName):
-            fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data_" + str(time.time()) + ".pickle"
-            print("PNP.save_data: WARNING - specified saveDir + saveName already exists. Saving simulation data as " +
-                  fileName + " instead.")
-        with open(fileName, 'wb') as f:
-            pickle.dump(self, f)
-        f.close()
+            # check that the file does not already exist. If it does, print a warning and save with the time appended
+            if os.path.isfile(fileName):
+                fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data_" + str(time.time()) + ".pickle"
+                print("PNP.save_data: WARNING - specified saveDir + saveName already exists. Saving simulation data as " +
+                      fileName + " instead.")
+            with open(fileName, 'wb') as f:
+                pickle.dump(self, f)
+            f.close()
+        else:
+            pass
 
     def check_index_matching(self,lists:list, keys:list):
         """
