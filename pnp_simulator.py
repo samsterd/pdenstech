@@ -1,5 +1,5 @@
 import numpy as np
-from pde import PDEBase, FieldCollection, CartesianGrid, ScalarField,  MemoryStorage,plot_kymograph, plot_kymographs, solve_poisson_equation
+from pde import PDEBase, FieldCollection, CartesianGrid, ScalarField,  MemoryStorage, movie, plot_kymographs, solve_poisson_equation
 from matplotlib import pyplot as plt
 import math
 import voltage_functions as vf
@@ -39,10 +39,10 @@ params = {
     ##################################################
 
     # note: all lists describing the chemical species to simulate MUST have equal lengths
-    "names": ["Mg", "Cl"],  # list of strings: names of each species in simulation
-    "charges": [2, -1],  # list of integers: charges of each species
+    "names": ["Na", "Cl"],  # list of strings: names of each species in simulation
+    "charges": [1, -1],  # list of integers: charges of each species
     "diffusivities": [2.2 * (10 ** -5), 2.2 * (10 ** -5)], # list of floats: diffusion constant of each species, in cm^2/s
-    "bulkConcentrations": [0.05, 0.1],  # list of floats: concentration at far edge of simulation box, in mol/L
+    "bulkConcentrations": [0.1, 0.1],  # list of floats: concentration at far edge of simulation box, in mol/L
     "initialConcentrationProfiles": ["bulk", "bulk"],  # list of floats or ndarrays: initial concentration profiles
                                                         # options:
                                                         # "bulk" to match the bulkConcentration of the species
@@ -89,11 +89,11 @@ params = {
     ####### Plotting and Saving #################
     ############################################
     "plotQ" : True, # boolean: should a plots be generated after running the simulation?
-    "saveQ" : False, # boolean: should the result of the simulation and plots (if made) be pickled (saved) when the simulation finishes?
+    "saveQ" : True, # boolean: should the result of the simulation and plots (if made) be pickled (saved) when the simulation finishes?
     "showPlotsQ": True,  # boolean: should the generated plots be shown after they are generated?
-    "saveName" : "default", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
-    "saveDir" : "", # string: the directory to save data in
-    "plotTypes" : ["concVsTime"], # list of strings: what types of plots should be generated.
+    "saveName" : "nacl_testing_", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
+    "saveDir" : "C://Users//shams//Drexel University//Chang Lab - General//Individual//Sam Amsterdam//transient electrochemistry//pnp-simulator//", # string: the directory to save data in
+    "plotTypes" : ["kymographs", "concVsTime"], # list of strings: what types of plots should be generated.
                         # Current options are "kymographs", "concVsTime",
     "plotArgs" : {"concVsTime":[0,5,20]}, # dict: key is a plotType and val is a list of extra parameters to pass into the plotting function
                      #      Currently used for "concVsTime" to specify what points to plot
@@ -118,8 +118,11 @@ class PNP(PDEBase):
         called by the run_simulation function elsewhere in the script
         plot_data(plotTypes, saveQ, saveName, saveDir) -- plots the results of the simulation
         check_index_matching(lists, keys) -- checks that a list of lists all have the same length, raises an exception otherwise
+
+        Init does initialize the saveVars class variable, which allows the clas to track which variables are saved and loaded
+        between uses
         """
-        pass
+        self.saveVars = ["inputParams", "result", "storage", "ePot_bc"]
 
     def unpack_parameters(self, params:dict):
         """
@@ -152,7 +155,7 @@ class PNP(PDEBase):
         self.check_index_matching(indexMatchedLists, indexMatchedKeys)
 
         # save the initial parameters for later reference
-        self.params = params
+        self.inputParams = params
         self.dt = params["tStep"]
 
         # calculate values that will be used in every simulation iteration and save them as class variables
@@ -247,7 +250,7 @@ class PNP(PDEBase):
             concArrays.append(profileArray)
 
         # gather all concArrays into a FieldCollection and return
-        return FieldCollection([ScalarField(grid, concArray) for concArray in concArrays])
+        return FieldCollection([ScalarField(grid, concArray) for concArray in concArrays], labels = params["names"])
 
     def evolution_rate(self, state, t=0):
         """
@@ -314,6 +317,7 @@ class PNP(PDEBase):
     #     return post_step_hook, 0.0 # hook function + initial data for t
 
     # todo: verify this works on pickled data
+    # todo: implement movies (need to make sure ffmpeg is in sys.path)
     def plot_data(self, params:dict):
         """
         Plots the results of the simulation
@@ -339,13 +343,13 @@ class PNP(PDEBase):
         """
 
         # gather inputs in a cleaner way
-        plotTypes = params["plotTypes"]
-        plotArgs = params["plotArgs"]
-        saveQ = params["saveQ"]
-        showPlotsQ = params["showPlotsQ"]
-        saveFormat = params["plotSaveFormat"]
-        saveName = params["saveName"]
-        saveDir = params["saveDir"]
+        plotTypes = self.inputParams["plotTypes"]
+        plotArgs = self.inputParams["plotArgs"]
+        saveQ = self.inputParams["saveQ"]
+        showPlotsQ = self.inputParams["showPlotsQ"]
+        saveFormat = self.inputParams["plotSaveFormat"]
+        saveName = self.inputParams["saveName"]
+        saveDir = self.inputParams["saveDir"]
 
         # generate the base filename and generate a timestamp in case there are any overlaps with existing files
         fileBaseName = os.path.join(saveDir, saveName)
@@ -377,18 +381,15 @@ class PNP(PDEBase):
                     # gather storage data, grid info, and generate time array
                     storageArr = np.array(self.storage.data)
                     gridArr = self.initConcFields.grid.coordinate_arrays[0]
-                    numberOfStoragePoints = math.floor(params["tStop"]/params["trackerStep"]) + 1
-                    tArr = np.linspace(0, params["tStop"], numberOfStoragePoints, endpoint = True)
+                    numberOfStoragePoints = math.floor(self.inputParams["tStop"]/self.inputParams["trackerStep"]) + 1
+                    tArr = np.linspace(0, self.inputParams["tStop"], numberOfStoragePoints, endpoint = True)
 
                     # generate the plots by iterating through plotPoints and numberOfSpecies
                     for point in plotPoints:
                         for species in range(self.numberOfSpecies):
-                            plotLabel = params["names"][species] + " at x = " + str(gridArr[point]) + " nm"
+                            plotLabel = self.inputParams["names"][species] + " at x = " + str(gridArr[point]) + " nm"
                             plt.plot(tArr, storageArr[:, species, point], label = plotLabel)
                     plt.legend()
-
-            if showPlotsQ:
-                plt.show()
 
             if saveQ:
 
@@ -396,49 +397,100 @@ class PNP(PDEBase):
 
                 # check that the file does not already exist. If it does, print a warning and save with the time appended
                 if os.path.isfile(fileName):
-                    fileName = os.path.join(params["saveDir"], params["saveName"]) + "_" + plot + "_" + str(
+                    fileName = os.path.join(self.inputParams["saveDir"], self.inputParams["saveName"]) + "_" + plot + "_" + str(
                         time.time()) + saveFormat
                     print(
                         "PNP.plot_data: WARNING - specified saveDir + saveName already exists. Saving plot as " +
                         fileName + " instead.")
 
                 # save the file and close the plot if it wasn't displayed
-                plt.savefig(fileName, dpi = 300)
-                if not showPlotsQ:
-                    plt.close()
+                if plot == "kymographs":
+                    # kymographs option action = "close" saves the plot
+                    plot_kymographs(self.storage, filename = fileName, action = "close", fig_style = {'dpi':300})
+                else:
+                    plt.savefig(fileName, dpi = 300)
+                    if not showPlotsQ:
+                        plt.close()
 
-    # todo: figure out if data is actually pickling. If not,the issue is probably because a method cannot pickle itself?
-    #   i.e. cannot pickle(self). Consider gathering all relevant data into a dict and pickling that
-    def save_data(self, params:dict, result):
+            if showPlotsQ:
+                plt.show()
+
+    # todo: re-implement this as a class method that pickles the essential information. then implement load to read the pickl
+    #   AND re-populate the information. This should be done in a way that allows plotting functions to work on a full simulation
+    def save_data(self):
         """
-        Saves the results of the simulation as a pickle
+        Saves the results of the simulation as a pickle, which can then be loaded and analyzed or rerun later
 
         Args:
-            params (dict): a dict of simulation parameters. The following keys are required to determine the function behavior:
-            Keys:
-            saveQ (boolean): should the simulation data be saved
-            saveName (string): name of the plots that are saved. File names are saveName_data.pickle
-            saveDir (string): directory to save the plots in
+            None
+
+        The following information specified by self.saveVars is gathered in a dict and pickled:
+            self.inputParams
+            self.result
+            self.storage
+            self.ePot_bc
         """
-        if "saveQ" not in params.keys() or "saveName" not in params.keys() or "saveDir" not in params.keys():
-            ValueError("PNP.save_data: supplied parameter dict does not have the required keys saveQ, saveName, and saveDir.")
+        if "saveName" not in params.keys() or "saveDir" not in params.keys():
+            ValueError(
+                "PNP.save_data: supplied parameter dict does not have the required keys saveQ, saveName, and saveDir.")
 
-        if params["saveQ"]:
-            # make sure the result is saved as a class variable
-            self.result = result
+        # gather data to pickle
+        # note that ePot_bc is saved because it changes during the simulation. This allows the final form to be recovered
+        #   without re-running the experiment. I can't think of a good reason to do this, but for the sake of robustness why not?
+        saveDat = {'inputParams':self.inputParams, 'result':self.result, 'storage':self.storage, 'ePot_bc': self.ePot_bc}
 
-            fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data.pickle"
+        fileName = os.path.join(self.inputParams["saveDir"], self.inputParams["saveName"]) + "_data.pickle"
 
-            # check that the file does not already exist. If it does, print a warning and save with the time appended
-            if os.path.isfile(fileName):
-                fileName = os.path.join(params["saveDir"], params["saveName"]) + "_data_" + str(time.time()) + ".pickle"
-                print("PNP.save_data: WARNING - specified saveDir + saveName already exists. Saving simulation data as " +
-                      fileName + " instead.")
-            with open(fileName, 'wb') as f:
-                pickle.dump(self, f)
-            f.close()
-        else:
-            pass
+        # check that the file does not already exist. If it does, print a warning and save with the time appended
+        if os.path.isfile(fileName):
+            fileName = os.path.join(self.inputParams["saveDir"], self.inputParams["saveName"]) + "_data_" + str(time.time()) + ".pickle"
+            print("PNP.save_data: WARNING - specified saveDir + saveName already exists. Saving simulation data as " +
+                  fileName + " instead.")
+        with open(fileName, 'wb') as f:
+            pickle.dump(saveDat, f)
+        f.close()
+
+    def load_data(self, pickleFile):
+        """
+        Loads pickled data into an empty PNP class instance.
+
+        Args:
+            pickleFile (str): the file path and name of the pickle to load
+
+        Returns:
+            None
+
+        If the PNP class instance was previously empty, all of its class variables will be populated. Normal plotting and
+        analysis methods can be used on the loaded class instance
+        """
+        # check if the PNP instance was previously initialized by checking if any of the save variables already exist in the PNP class
+        for saveVar in self.saveVars:
+            if hasattr(self, saveVar):
+                ValueError("PNP.load_data: attempting to load a pickle into a PNP instance that has already been populated.\n"
+                           "To avoid overwriting data, this action is blocked. Instead create a new instance of the PNP class and load into that:\n"
+                           "newInstance = PNP()\n"
+                           "newInstance.load_data(file)")
+
+        # open the pickle
+        with open(pickleFile, 'rb') as f:
+            pnpDict = pickle.load(f)
+        f.close()
+
+        # check that the loaded file is a dict with the correct keys
+        if type(pnpDict) != dict:
+            TypeError("PNP.load_data: the loaded pickle was not a dict. Loading aborted, check that the file name is correct.")
+        for saveVar in self.saveVars:
+            if saveVar not in pnpDict.keys():
+                KeyError("PNP.load_data: the loaded pickle is missing data key " + saveVar + ". Loading is not possible."
+                         "Check that the file name is correct and that the data was created by PNP.save_data().")
+
+        # use unpack_parameters to set up the initial data. this must be done before re-saving self.storage and self.ePot_bc to avoid overwriting the saved versions
+        self.unpack_parameters(pnpDict["inputParams"])
+
+        # save/overwrite result, storage, and ePot_bc
+        self.result = pnpDict["result"]
+        self.storage = pnpDict["storage"]
+        self.ePot_bc = pnpDict["ePot_bc"]
 
     def check_index_matching(self,lists:list, keys:list):
         """
@@ -489,9 +541,17 @@ def run_simulation(params:dict):
     """
     eq = PNP()
     solveParams = eq.unpack_parameters(params)
-    result = eq.solve(*solveParams)
-    eq.save_data(params, result)
+    eq.result = eq.solve(*solveParams)
+    eq.save_data()
     eq.plot_data(params)
     return 0
 
 run_simulation(params)
+
+# path = "C://Users//shams//Drexel University//Chang Lab - General//Individual//Sam Amsterdam//transient electrochemistry//pnp-simulator//"
+# file = path + "nacl_testing__data.pickle"
+# eq = PNP()
+# eq.load_data(file)
+# eq.plot_data(eq.params)
+#
+# print('done')
