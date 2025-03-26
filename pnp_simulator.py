@@ -29,21 +29,17 @@ import time
 #       plot the results
 
 params = {
-    #todo: move parameters that are defined in terms of other parameters to unpack_params method
-    #todo: convert species dependent parameters to index-matched lists
-    #todo: handle unit conversions in unpack params
-    # define constants. Units are m, eV, e, K, V
 
     ####################################################
     ####### Chemical Components ####################
     ##################################################
 
     # note: all lists describing the chemical species to simulate MUST have equal lengths
-    "names": ["Na", "Cl"],  # list of strings: names of each species in simulation
-    "charges": [1, -1],  # list of integers: charges of each species
-    "diffusivities": [2.2 * (10 ** -5), 2.2 * (10 ** -5)], # list of floats: diffusion constant of each species, in cm^2/s
-    "bulkConcentrations": [0.1, 0.1],  # list of floats: concentration at far edge of simulation box, in mol/L
-    "initialConcentrationProfiles": ["bulk", "bulk"],  # list of floats or ndarrays: initial concentration profiles
+    "names": ["A+", "a+", "B-"],  # list of strings: names of each species in simulation
+    "charges": [1, 1, -1],  # list of integers: charges of each species
+    "diffusivities": [1.1 * (10 ** -5), 2.2 * (10 ** -5), 2.2 * (10 ** -5)], # list of floats: diffusion constant of each species, in cm^2/s
+    "bulkConcentrations": [0.05, 0.05, 0.1],  # list of floats: concentration at far edge of simulation box, in mol/L
+    "initialConcentrationProfiles": ["bulk", "bulk", "bulk"],  # list of floats or ndarrays: initial concentration profiles
                                                         # options:
                                                         # "bulk" to match the bulkConcentration of the species
                                                         # "zero" to set initial to zero
@@ -58,14 +54,14 @@ params = {
     ######### Simulation Conditions ##################
     ################################################
 
-    "voltageFunction" : vf.cosVoltage, # function: must take the state and time as arguments and
+    "voltageFunction" : vf.equilBeforeSquare, # function: must take the state and time as arguments and
                             # output a single float to be used as the applied voltage.
-    "voltageFunctionArgs" : [0.0005, 0.1, 0.05], # list: extra arguments to pass to the voltage function, if needed
+    "voltageFunctionArgs" : [0.05, 0.00002, 0.5, -0.5, 0.5], # list: extra arguments to pass to the voltage function, if needed
                                 # if no extra arguments are needed, use an empty list
     "gridMax" : 1, # float: distance from the electrode surface to simulate, in nm
     "gridStep": 0.01,  # float: distance between grid points, in nm
     "tStep": 0.00001,  # float: time step interval for each simulation iteration, in ns
-    "tStop": 0.005,  # float: time the simulation will run to. Number of steps = tStop/tStep
+    "tStop": 0.1,  # float: time the simulation will run to. Number of steps = tStop/tStep
     "trackerStep" : 0.00005, # float: time step interval that the tracker will record data, in ns
                            # this should always be greater than tStep and less than tStop
                            # selecting a smaller number will give more information in plots but at the cost of memory usage
@@ -91,7 +87,7 @@ params = {
     "plotQ" : True, # boolean: should a plots be generated after running the simulation?
     "saveQ" : True, # boolean: should the result of the simulation and plots (if made) be pickled (saved) when the simulation finishes?
     "showPlotsQ": True,  # boolean: should the generated plots be shown after they are generated?
-    "saveName" : "nacl_testing_", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
+    "saveName" : "AaB_mixedcation_equil_squarewave_05equil_05duty_05amp_-05offset_200fsperiod_phaseCorrection", # string: the base name of the simulation to save associated date. File names are saveName_dataType.saveFormat
     "saveDir" : "C://Users//shams//Drexel University//Chang Lab - General//Individual//Sam Amsterdam//transient electrochemistry//pnp-simulator//", # string: the directory to save data in
     "plotTypes" : ["kymographs", "concVsTime"], # list of strings: what types of plots should be generated.
                         # Current options are "kymographs", "concVsTime",
@@ -110,10 +106,8 @@ class PNP(PDEBase):
         unpack_parameters(params) -- takes a user-supplied dict of simulation parameters and converts the needed ones into
         into class variables. A list of needed keys are provided in the documentation of the unpack_parameters
         initialize_fields(params) -- uses the input parameters to generate the fields for the start of the simulation
-        evolution_rate(state, t) -- the function that is run every iteration of the simulation in order to advance. This
-        is not directly called by the user but is used by PDEBase.solve()
-        post_step_hook(state_data, t) -- a function which is evaluated every iteration after evolution_rate. It is used in
-        the PNP class to change the applied voltage and evaluate any user-defined metrics on the data
+        evolution_rate(state, t) -- the function that is run every iteration of the simulation in order to advance. The
+        voltage boundary conditions are also updated in this function. This is not directly called by the user but is used by PDEBase.solve()
         solve(fields, t_range, dt, tracker) -- PDEBase method used to run the simulation. It is not modified here but is
         called by the run_simulation function elsewhere in the script
         plot_data(plotTypes, saveQ, saveName, saveDir) -- plots the results of the simulation
@@ -184,7 +178,6 @@ class PNP(PDEBase):
         self.initVoltage = self.voltageFunction(0, self.initConcFields, *self.voltageArgs)
 
         # determine boundary conditions and save them as class variables
-        # todo: check that the bc explanations are correct and consistent
         # concentration boundary conditions for calculating diffusion:
         #   Left derivative is zero since no flux comes from the electrode
         #   Right value (far edge away from electrode) is the bulk value
@@ -294,29 +287,6 @@ class PNP(PDEBase):
 
         return FieldCollection(dcdt)
 
-    #todo: update documentation about abandoning post step hook. the necessary operations can be updated within the
-    #       evolution function and the post_step_hook is complicated :(
-
-    # def make_post_step_hook(self, state):
-    #     """Create a hook function that is called after every time step"""
-    #
-    #     def post_step_hook(self, state, t):
-    #         """
-    #         Update the voltage after every iteration of the simulation using self.voltageFunction
-    #
-    #         Args:
-    #             state_data (FieldCollection): current state of the simulation
-    #             t (float): simulation time
-    #         Returns:
-    #             None
-    #         """
-    #         #calculate new voltage, update boundary conditions
-    #         newVoltage = self.voltageFunction(t, state, *self.voltageArgs)
-    #         self.ePot_bc = {"x-": {"derivative": newVoltage}, "x+": {"value": 0}}
-    #
-    #     return post_step_hook, 0.0 # hook function + initial data for t
-
-    # todo: verify this works on pickled data
     # todo: implement movies (need to make sure ffmpeg is in sys.path)
     def plot_data(self, params:dict):
         """
@@ -415,8 +385,6 @@ class PNP(PDEBase):
             if showPlotsQ:
                 plt.show()
 
-    # todo: re-implement this as a class method that pickles the essential information. then implement load to read the pickl
-    #   AND re-populate the information. This should be done in a way that allows plotting functions to work on a full simulation
     def save_data(self):
         """
         Saves the results of the simulation as a pickle, which can then be loaded and analyzed or rerun later
