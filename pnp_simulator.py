@@ -50,6 +50,44 @@ params = {
     "solventDielectric" : 1, # float: relative dielectric constant of the solvent
     "temperature": 300,  # float: temperature in K. Raising temperature increases the ratio of diffusion to drift
 
+    #######################################################
+    ############ Reactions ###############################
+    ######################################################
+    # Information for chemical reactions. For now these are only implemented with rate constants and orders, ignoring thermodynamic data
+    #   Reactions are divided into bulkReactions (which occur between species in solution) and surfaceReactions (which only occur at the electrode surface)
+    #   Bulk reactions follow Arrhenius kinetics, with an activation energy (Ea) and a reaction rate constant for T= 0 K (k0) and a Boltzmann factor
+    #       dc/dt = k exp(Ea/kT) Product([conc of reactant i]**(order of reactant i))
+    #   Surface reactions replace the activation energy term with equilibrium potential term (E0) in order to calculate the reaction overpotential
+    #       The rest of the equation follows Arrhenius kinetics. surface reactions are only calculated for the reactants at the electrode surface. Adsorption is not currently implemented
+    #       Parameters: reaction constant (k0), equil potential (E0), field at surface (E)
+    #       dc/dt = k0 exp(E0-E/kT) Product([conc of reactant i]**(order of reactant i))
+    # todo: implement kinetics that approximate based on gibbs energy of reaction
+    # todo: add contribution from electrochemical potenial for bulk reactions
+    #   todo: test if surface reaction gives mass-transfer limited Butler-Volmer Equations
+
+    "bulkReactions" : [{}], # list of dicts: definitions for each reaction that can occur through the reaction mixture
+                            #       Within each reaction, the following fields are required:
+                            #           "name" (str): name to refer to the reaction
+                            #           "k" (float): Rate constant of the reaction, in M**(sum(orders) -1) /s (will be converted to number/nm**3 internally)
+                            #           "Ea" (float): activation energy in eV
+                            #           "reactants" (list of ints): indices of each reactant
+                            #           "orders" (list of floats): reaction order of each reactant, index matched to "reactants"
+                            #           "stoichiometry" (list of ints): stoichiometric coefficient for each species
+                            #               the calculated dc/dt at each location will be multiplied by the stoichiometry for each species to get that species' change in conc
+                            #               This should include products (positive coefficients) and reactants (negative coeffs)
+                            #               This must be index matched to "names"
+    "surfaceReactions" : [{}], # list of dicts: definitoins for each reaction that occurs at the electrode surface
+                                #       Within each reaction, the following fields are required:
+                                #           "name" (str): name to refer to the reaction
+                                #           "k" (float): Rate constant of the reaction, in M**(sum(orders) -1) /s (will be converted to number/nm**3 internally)
+                                #           "E0" (float): equilibrium electric potential, used to calculate the overpotential
+                                #           "reactants" (list of ints): indices of each reactant
+                                #           "orders" (list of floats): reaction order of each reactant, index matched to "reactants"
+                                #           "stoichiometry" (list of ints): stoichiometric coefficient for each species
+                                #               the calculated dc/dt at each location will be multiplied by the stoichiometry for each species to get that species' change in conc
+                                #               This should include products (positive coefficients) and reactants (negative coeffs)
+                                #               This must be index matched to "names"
+
     ##################################################
     ######### Simulation Conditions ##################
     ################################################
@@ -104,12 +142,14 @@ class PNP(PDEBase):
 
         Methods:
         unpack_parameters(params) -- takes a user-supplied dict of simulation parameters and converts the needed ones into
-        into class variables. A list of needed keys are provided in the documentation of the unpack_parameters
+            into class variables. A list of needed keys are provided in the documentation of the unpack_parameters
         initialize_fields(params) -- uses the input parameters to generate the fields for the start of the simulation
         evolution_rate(state, t) -- the function that is run every iteration of the simulation in order to advance. The
-        voltage boundary conditions are also updated in this function. This is not directly called by the user but is used by PDEBase.solve()
+            voltage boundary conditions are also updated in this function. This is not directly called by the user but is used by PDEBase.solve()
+        update_rxns(concs, ePot) -- calculates the dc/dt due to user-specified reactions. This is called during evolution_rate
+            but is moved to a separate function for readability
         solve(fields, t_range, dt, tracker) -- PDEBase method used to run the simulation. It is not modified here but is
-        called by the run_simulation function elsewhere in the script
+            called by the run_simulation function elsewhere in the script
         plot_data(plotTypes, saveQ, saveName, saveDir) -- plots the results of the simulation
         check_index_matching(lists, keys) -- checks that a list of lists all have the same length, raises an exception otherwise
 
@@ -151,6 +191,7 @@ class PNP(PDEBase):
         # save the initial parameters for later reference
         self.inputParams = params
         self.dt = params["tStep"]
+        self.numberOfPoints = math.floor(params["gridLen"]/params["gridStep"]) # math.floor used to ensure numberOfPoints is an integer
 
         # calculate values that will be used in every simulation iteration and save them as class variables
         # lists are converted to arrays in order to multiply by floats
@@ -160,6 +201,17 @@ class PNP(PDEBase):
         self.bulk_concs = (params["Av"] / (10**24)) * np.array(params["bulkConcentrations"]) # bulk concentrations converted from mol/L to number / nm^3
         self.zs = np.array(params["charges"])
         self.numberOfSpecies = len(self.zs) # number of species comes up a lot later
+
+        # prep reaction parameters: pre-calculate Arrhenius factors, check for index matching
+        self.bulkRxns = self.params["bulkReactions"]
+        self.surfRxns = self.params["surfaceReactions"]
+        for rxn in self.bulkRxns:
+            self.check_index_matching([rxn["reactants"], rxn["orders"]], ["reactants", "orders"])
+            self.check_index_matching([params["names"], rxn["stoichiometry"]], ["names", "stoichiometry"])
+            rxn["prefactor"] = rxn["k"] * math.exp(rxn["Ea"] / self.kt)
+        for rxn in self.surfRxns:
+            self.check_index_matching([rxn["reactants"], rxn["orders"]], ["reactants", "orders"])
+            self.check_index_matching([params["names"], rxn["stoichiometry"]], ["names", "stoichiometry"])
 
         # calculate the debye length, just because it's good to know and we might want it later
         # print a note comparing the debye length to the grid size. grid size should be >> debye length
@@ -208,8 +260,7 @@ class PNP(PDEBase):
             FieldCollection: the initial concentration profiles of each simulated species. These are also saved as class variables
         """
         # initialize the grid
-        numberOfPoints = math.floor(params["gridMax"] / params["gridStep"]) # math.floor used to ensure numberOfPoints is an integer
-        grid = CartesianGrid([(0, params["gridMax"])], [numberOfPoints], False)
+        self.grid = CartesianGrid([(0, params["gridMax"])], [self.numberOfPoints], False)
 
         # for each species, create a field using the corresponding init profile
         concArrays = []
@@ -219,31 +270,31 @@ class PNP(PDEBase):
 
             # if "bulk" match bulk conc
             if initProfile == "bulk":
-                profileArray = np.ones(numberOfPoints) * self.bulk_concs[i]
+                profileArray = np.ones(self.numberOfPoints) * self.bulk_concs[i]
 
             # if "zero" set to 0
             elif initProfile == "zero":
-                profileArray = np.zeros(numberOfPoints)
+                profileArray = np.zeros(self.numberOfPoints)
 
             # if a custom array, first check that it is the correct length (raise error if not), than create
             elif type(initProfile) == np.ndarray:
 
                 # handle malformed inputs
-                if len(initProfile) < numberOfPoints:
+                if len(initProfile) < self.numberOfPoints:
                     IndexError("PNP.initialize_fields: a supplied initial concentration profile for species " +
                                str(params["names"][i])) + (" is shorter than the grid length specified by gridMax and "
                                                            "gridStep. Simulation cannot run until this is addressed.")
-                elif len(initProfile) > numberOfPoints:
+                elif len(initProfile) > self.numberOfPoints:
                     print("PNP.initialize_fields: a supplied initial concentration profile for species " +
                                str(params["names"][i])) + (" is longer than the grid length specified by gridMax and "
                                                            "gridStep. Excess values beyond the grid length will be ignored.")
 
-                profileArray = initProfile[:numberOfPoints] # slice cuts off excess values. Warning about this situation is raised above
+                profileArray = initProfile[:self.numberOfPoints] # slice cuts off excess values. Warning about this situation is raised above
 
             concArrays.append(profileArray)
 
         # gather all concArrays into a FieldCollection and return
-        return FieldCollection([ScalarField(grid, concArray) for concArray in concArrays], labels = params["names"])
+        return FieldCollection([ScalarField(self.grid, concArray) for concArray in concArrays], labels = params["names"])
 
     def evolution_rate(self, state, t=0):
         """
@@ -279,13 +330,88 @@ class PNP(PDEBase):
         # solve for the drift and diffusion components of the Nernst-Planck equations, then combine for total dc/dt
         drift = [((self.diffusivities[i] * chargeConcs[i] / self.kt) * eField).divergence(bc = self.drift_bc) for i in range(self.numberOfSpecies)]
         diff = [self.diffusivities[i] * concs[i].laplace(bc = self.c_bcs[i]) for i in range(self.numberOfSpecies)]
-        dcdt = [drift[i] + diff[i] for i in range(self.numberOfSpecies)]
+
+        # calculate reaction changes
+        rxn = self.update_rxns(concs, ePotential)
+
+        dcdt = [drift[i] + diff[i] + rxn[i] for i in range(self.numberOfSpecies)]
 
         # calculate the voltage for the next step
         newVoltage = self.voltageFunction(t + self.dt, state, *self.voltageArgs)
         self.ePot_bc = {"x-": {"derivative": newVoltage}, "x+": {"value": 0}}
 
         return FieldCollection(dcdt)
+
+    # todo: add documentation to __init__
+    def update_rxns(self, concs, ePot):
+        """
+        Calculates the dc/dt for each species based on the reactions specified in the input parameters
+
+        Args:
+            concs (FieldCollection): the current state of the simulation
+            ePot (ScalarField): the electric potential of the simulation (from solving Poisson's Equation)
+        Returns:
+            list of ScalarFields: the dc/dt of each species due to the sum of all bulk reactions
+        """
+        # gather the data arrays from the conc fields as a vertical stack of arrays
+        # dimensions are grid len x number of species
+        concArr = np.zeros((self.numberOfSpecies, self.numberOfPoints))
+        for i in range(self.numberOfSpecies):
+            concArr[i,:] = concs[i].data
+
+        # construct an array to hold the dc/dt for each species
+        totalRxndcdt = np.zeros((self.numberOfSpecies, self.numberOfPoints))
+
+        # first handle the bulk reactions
+        # todo: there are a lot of duplicated variable names, makes sure there are no aliasing issues
+        for rxn in self.bulkRxns:
+
+            # gather rxn info
+            reactants = rxn["reactants"]
+            orders = rxn["orders"]
+            prefactor = rxn["prefactor"]
+
+            # construct an array out of the order-weighted concentrations of each reactant
+            orderConcs = np.zeros((len(reactants), self.numberOfPoints))
+            for i in range(len(reactants)):
+                # note: reactants[i] is the row of the species in concArr
+                orderConcs[i,:] = concArr[reactants[i],:] ** orders[i]
+
+            # calculate the overall non-stoichiometric dc/dt by multiplying every element in the stack along with the prefactor
+            nonStoichdcdt = prefactor * np.prod(orderConcs, axis = 0)
+
+            # iterate through the stoichiometry, add the stoichiometric dc/dt to the total dc/dt array at the correct row
+            for i in range(self.numberOfSpecies):
+                factor = rxn["stoichiometry"][i]
+                if factor == 0: # the compiler would probably do this optimization on its own, but whatever
+                    pass
+                else:
+                    totalRxndcdt[i,:] += factor * nonStoichdcdt
+
+        # next handle the surface reactions in a similar way but only working with the first elements of each conc field
+        for rxn in self.surfRxns:
+
+            # gather rxn info
+            reactants = rxn["reactants"]
+            orders = rxn["orders"]
+            # todo: check signs on overpotential in anodic vs cathodic rxn
+            overpotential = ePot.data[0] - rxn["E0"]
+            prefactor = overpotential / self.kt
+
+            # construct an array of the order-weighted concentrations of each reactant at the surface
+            # since this data is much smaller than the full array, we can work directly with lists instead
+            orderConcs = [concArr[reactants[i],0] ** orders[i] for i in range(len(reactants))]
+
+            # calculate the non-stoichiometric dc/dt by multiplying every element in the list with the prefactor
+            nonStoichdcdt = math.prod(orderConcs) * prefactor
+
+            # iterate through stoichiometry, add the stoichiometric dc/dt to the first element in the corresponding row of the total dc/dt
+            for i in range(self.numberOfSpecies):
+                factor = rxn["stoichiometry"][i]
+                totalRxndcdt[i,0] += factor * nonStoichdcdt
+
+        # return a list of the dc/dt as scalar fields
+        return [ScalarField(self.grid, totalRxndcdt[i,:]) for i in range(self.numberOfSpecies)]
 
     # todo: implement movies (need to make sure ffmpeg is in sys.path)
     def plot_data(self, params:dict):
@@ -352,7 +478,7 @@ class PNP(PDEBase):
                     storageArr = np.array(self.storage.data)
                     gridArr = self.initConcFields.grid.coordinate_arrays[0]
                     numberOfStoragePoints = math.floor(self.inputParams["tStop"]/self.inputParams["trackerStep"]) + 1
-                    tArr = np.linspace(0, self.inputParams["tStop"], numberOfStoragePoints, endpoint = True)
+                    tArr = np.linspace(0, self.inputParams["tStop"]/self.inputParams["tStep"], numberOfStoragePoints, endpoint = True)
 
                     # generate the plots by iterating through plotPoints and numberOfSpecies
                     for point in plotPoints:
@@ -510,7 +636,8 @@ def run_simulation(params:dict):
     eq = PNP()
     solveParams = eq.unpack_parameters(params)
     eq.result = eq.solve(*solveParams)
-    eq.save_data()
+    if params["saveQ"]:
+        eq.save_data()
     eq.plot_data(params)
     return 0
 
